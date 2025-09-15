@@ -1,5 +1,5 @@
-# lead_watcher.py — простая версия: фильтр ключевых слов + минус-слова + ИИ (опц.)
-import os, json
+# lead_watcher.py — фильтр ключевых слов + минус-слова + отсев самопрезентаций + ИИ (опц.)
+import os, json, re
 from datetime import datetime
 from telethon import events
 from telethon.sync import TelegramClient
@@ -13,7 +13,6 @@ STRING   = os.getenv("TELEGRAM_STRING_SESSION", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # 2) Если ENV пусты и вы запускаете локально — можно подставить ЗДЕСЬ (необязательно):
-#    Пример:
 # API_ID = 1234567
 # API_HASH = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # STRING = "1AAABBB....очень_длинная_строка..."
@@ -85,6 +84,42 @@ async def _score_with_ai(text: str) -> dict:
         data["score"] = 0.0
     return data
 
+# ====== Фильтр самопрезентаций/рекламы исполнителей ======
+PROVIDER_WORDS = [
+    "предлагаю", "окажу", "услуги", "сделаю", "настрою", "разработаю", "помогу",
+    "берусь", "выполню", "возьмусь", "мои компетенции", "мой опыт", "стек", "портфолио",
+    "техспец", "технический специалист", "обращайтесь", "пишите в лс", "готов взять",
+    "настройка под ключ", "под ключ", "веду проекты", "занимаюсь", "предоставляю"
+]
+FIRST_PERSON_HINTS = ["я ", "мы "]
+CONTACT_RE = re.compile(r'(\+?\d[\d\s\-\(\)]{9,}|@[\w\d_]{3,}|https?://|t\.me/|wa\.me/|vk\.me/|telegram\.me/)', re.I)
+HASHTAG_RE = re.compile(r'(?:^|\s)#\w+', re.U)
+
+def is_provider_pitch(text: str) -> bool:
+    """Грубый отсев: самопрезентация, прайсы, каталоги услуг."""
+    t = (text or "").lower()
+
+    # много хэштегов/ссылок/контактов
+    if len(HASHTAG_RE.findall(text)) >= 3:
+        return True
+    if len(re.findall(r'https?://|t\.me/', text, flags=re.I)) >= 2:
+        return True
+    if CONTACT_RE.search(text):
+        if any(w in t for w in PROVIDER_WORDS):
+            return True
+
+    # «я/мы + сделаю/настрою/окажу …»
+    if any(w in t for w in PROVIDER_WORDS) and any(h in t for h in FIRST_PERSON_HINTS):
+        return True
+
+    # маркдаун/список преимуществ (много пунктов-эмодзи/дефисов)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    bullets = sum(1 for ln in lines if ln.startswith(("-", "—", "•", "👉", "✅", "📌", "🔹", "🔸")))
+    if bullets >= 6 and len(lines) >= 8:
+        return True
+
+    return False
+
 # ====== Telegram ======
 client = TelegramClient(StringSession(STRING), API_ID, API_HASH)
 
@@ -114,16 +149,29 @@ async def handler(event):
     if not text:
         return
 
-    # Минус-слова — отрезаем резюме/поиск работы до любых затрат
+    # 1) Авто-исключение сообщений от ботов
+    try:
+        sender = await event.get_sender()
+        uname = (getattr(sender, "username", "") or "").lower()
+        if getattr(sender, "bot", False) or uname.endswith("bot"):
+            return
+    except Exception:
+        pass
+
+    # 2) Минус-слова — отрезаем резюме/поиск работы до любых затрат
     low = text.lower()
     if any(w in low for w in NEGATIVE_WORDS):
         return
 
-    # Быстрый фильтр по ключевым словам
+    # 3) Самопрезентации/рекламные посты — отсекаем
+    if is_provider_pitch(text):
+        return
+
+    # 4) Быстрый фильтр по ключевым словам
     if not _matches_keywords(text):
         return
 
-    # ИИ-оценка
+    # 5) ИИ-оценка
     data = await _score_with_ai(text)
     score = data.get("score", 0.0)
     if score < THRESHOLD:
@@ -132,7 +180,7 @@ async def handler(event):
     category = data.get("category", "unknown")
     reason = data.get("reason", "")
 
-    # Простой источник без ссылок (как просили)
+    # Простой источник (без ссылок/автора)
     source = getattr(getattr(event, "chat", None), "title", str(getattr(event, "chat_id", "unknown")))
 
     body = (
@@ -148,7 +196,6 @@ async def handler(event):
 
 # ====== Main ======
 def main():
-    # Подсказки, если кто-то забыл задать ENV локально
     for k in ("TELEGRAM_API_ID","TELEGRAM_API_HASH","TELEGRAM_STRING_SESSION","OPENAI_API_KEY"):
         if not os.getenv(k):
             print(f"⚠ Переменная {k} не установлена.")
