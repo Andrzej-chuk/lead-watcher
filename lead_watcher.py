@@ -1,4 +1,5 @@
-# lead_watcher.py — фильтр ключевых слов + минус-слова + отсев самопрезентаций + ИИ (опц.)
+# lead_watcher.py — ключевые слова + минус-слова + отсев самопрезентаций + ИИ
+# + красивые данные источника (чат/ссылка) и автора.
 import os, json, re
 from datetime import datetime
 from telethon import events
@@ -6,24 +7,16 @@ from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
 
 # ====== КОНФИГ ======
-# 1) По умолчанию читаем из ENV (Render/локально через $env:...).
 API_ID  = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 STRING   = os.getenv("TELEGRAM_STRING_SESSION", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-
-# 2) Если ENV пусты и вы запускаете локально — можно подставить ЗДЕСЬ (необязательно):
-# API_ID = 1234567
-# API_HASH = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-# STRING = "1AAABBB....очень_длинная_строка..."
-# OPENAI_API_KEY = "sk-..."
 
 DEST_CHAT = os.getenv("DEST_CHAT", "Лиды")   # "Лиды", "@username", "-100ид", либо "me"
 TARGET_CHATS = [x.strip() for x in os.getenv("TARGET_CHATS", "").split(",") if x.strip()]
 THRESHOLD = float(os.getenv("THRESHOLD", "0.75"))
 MODEL = os.getenv("MODEL", "gpt-4o-mini")
 
-# Ключевые слова: читаем из ENV; если нет — дефолт
 KEYWORDS = [k.strip().lower() for k in os.getenv(
     "KEYWORDS",
     "нужен, нужна, нужно, ищем, требуется, кто сделает, сделайте, автоматизация, интеграция, api, "
@@ -33,7 +26,6 @@ KEYWORDS = [k.strip().lower() for k in os.getenv(
     "shopify, woocommerce, tilda, маркетплейс, ozon, вайлдберриз, erp, odoo, zoho, миграция, обмен с сайтом"
 ).split(",")]
 
-# Минус-слова — отсекаем резюме/поиск работы
 NEGATIVE_WORDS = [
     "ищу работу", "ищу подработку", "готов стажироваться", "стажер", "стажёр",
     "junior", "джун", "моё резюме", "мое резюме", "резюме", "cv", "портфолио",
@@ -54,10 +46,6 @@ def _matches_keywords(text: str) -> bool:
     return any(kw in t for kw in KEYWORDS)
 
 async def _score_with_ai(text: str) -> dict:
-    """
-    Возвращает {score:0..1, category, reason}.
-    Если OPENAI_API_KEY не задан — возвращаем score=1.0 и пометку.
-    """
     if not oai:
         return {"score": 1.0, "category": "по ключевым словам", "reason": "AI выключен (нет OPENAI_API_KEY)"}
     system = (
@@ -96,28 +84,19 @@ CONTACT_RE = re.compile(r'(\+?\d[\d\s\-\(\)]{9,}|@[\w\d_]{3,}|https?://|t\.me/|w
 HASHTAG_RE = re.compile(r'(?:^|\s)#\w+', re.U)
 
 def is_provider_pitch(text: str) -> bool:
-    """Грубый отсев: самопрезентация, прайсы, каталоги услуг."""
     t = (text or "").lower()
-
-    # много хэштегов/ссылок/контактов
     if len(HASHTAG_RE.findall(text)) >= 3:
         return True
     if len(re.findall(r'https?://|t\.me/', text, flags=re.I)) >= 2:
         return True
-    if CONTACT_RE.search(text):
-        if any(w in t for w in PROVIDER_WORDS):
-            return True
-
-    # «я/мы + сделаю/настрою/окажу …»
+    if CONTACT_RE.search(text) and any(w in t for w in PROVIDER_WORDS):
+        return True
     if any(w in t for w in PROVIDER_WORDS) and any(h in t for h in FIRST_PERSON_HINTS):
         return True
-
-    # маркдаун/список преимуществ (много пунктов-эмодзи/дефисов)
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     bullets = sum(1 for ln in lines if ln.startswith(("-", "—", "•", "👉", "✅", "📌", "🔹", "🔸")))
     if bullets >= 6 and len(lines) >= 8:
         return True
-
     return False
 
 # ====== Telegram ======
@@ -125,7 +104,6 @@ client = TelegramClient(StringSession(STRING), API_ID, API_HASH)
 
 _dest_entity = None
 async def _resolve_dest():
-    """Разрешаем DEST_CHAT в entity (поддерживает 'me', @username, -100id, точное имя диалога)."""
     global _dest_entity
     if _dest_entity is not None:
         return _dest_entity
@@ -133,14 +111,19 @@ async def _resolve_dest():
         _dest_entity = "me"
         return _dest_entity
     try:
-        _dest_entity = await client.get_entity(DEST_CHAT)  # @username или -100id
+        _dest_entity = await client.get_entity(DEST_CHAT)
         return _dest_entity
     except Exception:
         async for d in client.iter_dialogs():
-            if d.name == DEST_CHAT:       # точное имя диалога
+            if d.name == DEST_CHAT:
                 _dest_entity = d.entity
                 return _dest_entity
     raise RuntimeError(f"Не найден получатель DEST_CHAT='{DEST_CHAT}'. Укажи точное имя, @username или -100ID.")
+
+def _build_private_link(chat_id: int, msg_id: int) -> str:
+    # для приватных супер-групп/каналов: https://t.me/c/<internal_id>/<msg_id>
+    s = str(chat_id)
+    return f"https://t.me/c/{s[4:]}/{msg_id}" if s.startswith("-100") else "(no link)"
 
 # ====== Обработчик ======
 @client.on(events.NewMessage(chats=TARGET_CHATS or None))
@@ -152,18 +135,18 @@ async def handler(event):
     # 1) Авто-исключение сообщений от ботов
     try:
         sender = await event.get_sender()
-        uname = (getattr(sender, "username", "") or "").lower()
-        if getattr(sender, "bot", False) or uname.endswith("bot"):
+        uname_sender = (getattr(sender, "username", "") or "").lower()
+        if getattr(sender, "bot", False) or uname_sender.endswith("bot"):
             return
     except Exception:
         pass
 
-    # 2) Минус-слова — отрезаем резюме/поиск работы до любых затрат
+    # 2) Минус-слова
     low = text.lower()
     if any(w in low for w in NEGATIVE_WORDS):
         return
 
-    # 3) Самопрезентации/рекламные посты — отсекаем
+    # 3) Самопрезентации/реклама услуг
     if is_provider_pitch(text):
         return
 
@@ -180,13 +163,31 @@ async def handler(event):
     category = data.get("category", "unknown")
     reason = data.get("reason", "")
 
-    # Простой источник (без ссылок/автора)
-    source = getattr(getattr(event, "chat", None), "title", str(getattr(event, "chat_id", "unknown")))
+    # === Красивые данные источника и автора ===
+    chat_ent = await client.get_entity(event.chat_id)
+    title = getattr(chat_ent, "title", None) or getattr(chat_ent, "first_name", "") or "unknown"
+    chat_uname = getattr(chat_ent, "username", None)
+
+    cid = getattr(event, "chat_id", None)
+    msg_id = event.message.id
+    if chat_uname:
+        msg_link = f"https://t.me/{chat_uname}/{msg_id}"
+        source_line = f"{title} (@{chat_uname}) | id: {cid}"
+    else:
+        msg_link = _build_private_link(cid, msg_id)
+        source_line = f"{title} (private) | id: {cid}"
+
+    sender = await event.get_sender()
+    author_name = (" ".join(filter(None, [getattr(sender, 'first_name', None), getattr(sender, 'last_name', None)])) or "unknown").strip()
+    author_username = getattr(sender, "username", None)
+    author_line = author_name + (f" (@{author_username})" if author_username else "")
 
     body = (
         f"🔔 ЛИД {int(score*100)}% · {category}\n\n"
         f"{text}\n\n"
-        f"Источник: {source}\n"
+        f"Источник: {source_line}\n"
+        f"Сообщение: {msg_link}\n"
+        f"Автор: {author_line}\n"
         f"Обоснование: {reason}\n"
         f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     )
